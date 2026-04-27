@@ -1,0 +1,439 @@
+
+
+
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+
+
+@dataclass
+class Match:
+    token: str
+    kind: str
+    start: int
+    end: int  # exclusive
+
+
+MONTHS = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december"
+]
+
+# Units are written as literal DFA chains; the program consumes these words
+# character by character through match_word().
+UNITS_AFTER_SPACE = [
+    ("million", "quantity"),
+    ("billion", "quantity"),
+    ("litre", "quantity"),
+    ("litres", "quantity"),
+    ("liter", "quantity"),
+    ("liters", "quantity"),
+    ("cup", "quantity"),
+    ("cups", "quantity"),
+    ("year", "quantity"),
+    ("years", "quantity"),
+    ("kilometre", "quantity"),
+    ("kilometres", "quantity"),
+    ("kilometer", "quantity"),
+    ("kilometers", "quantity"),
+    ("square kilometre", "quantity"),
+    ("square kilometres", "quantity"),
+    ("square kilometer", "quantity"),
+    ("square kilometers", "quantity"),
+    ("sq mi", "quantity"),
+    ("sq km", "quantity"),
+]
+
+UNITS_NO_SPACE = [
+    ("kg", "quantity"),
+    ("km", "quantity"),
+]
+
+
+def is_digit(ch: str) -> bool:
+    return "0" <= ch <= "9"
+
+
+def is_letter(ch: str) -> bool:
+    return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+
+def is_boundary_char(ch: str) -> bool:
+    """A boundary is whitespace or punctuation/end. Letters and digits are not boundaries."""
+    return not (is_digit(ch) or is_letter(ch))
+
+
+def has_left_boundary(text: str, pos: int) -> bool:
+    return pos == 0 or is_boundary_char(text[pos - 1])
+
+
+def has_right_boundary(text: str, pos: int) -> bool:
+    return pos >= len(text) or is_boundary_char(text[pos])
+
+
+def skip_spaces(text: str, pos: int) -> int:
+    """DFA-style loop over one or more whitespace characters."""
+    i = pos
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return i
+
+
+def match_word(text: str, pos: int, word: str) -> Optional[int]:
+    """
+    Match a fixed literal word one character at a time.
+    Spaces inside the word, such as 'sq mi', are handled as exactly one-or-more
+    whitespace characters in the input.
+    """
+    i = pos
+    j = 0
+    while j < len(word):
+        expected = word[j]
+        if expected == " ":
+            if i >= len(text) or not text[i].isspace():
+                return None
+            i = skip_spaces(text, i)
+            j += 1
+            continue
+
+        if i >= len(text):
+            return None
+        current = text[i].lower()
+        if current != expected:
+            return None
+        i += 1
+        j += 1
+    return i
+
+
+def match_any_word(text: str, pos: int, words: List[str]) -> Optional[Tuple[str, int]]:
+    """
+    Try literal words. The longest word is tested first to avoid accepting 'litre'
+    before 'litres'. Each candidate is still checked character by character.
+    """
+    for word in sorted(words, key=len, reverse=True):
+        end = match_word(text, pos, word)
+        if end is not None:
+            return word, end
+    return None
+
+
+def consume_integer_body(text: str, pos: int) -> Optional[Tuple[int, int, bool]]:
+    """
+    Consume a positive integer body from pos.
+    This DFA permits:
+        2017
+        329,847
+        127,350
+    It rejects invalid comma continuations such as 12,34 as a complete number.
+    Return: (end_position, number_of_digits, contains_comma)
+    """
+    i = pos
+    digit_count = 0
+    contains_comma = False
+
+    if i >= len(text) or not is_digit(text[i]):
+        return None
+
+    # First digit group: one or more digits.
+    while i < len(text) and is_digit(text[i]):
+        digit_count += 1
+        i += 1
+
+    # Optional repeated comma groups of exactly 3 digits.
+    while i < len(text) and text[i] == ",":
+        contains_comma = True
+        comma_pos = i
+        i += 1
+        group_digits = 0
+        while i < len(text) and is_digit(text[i]) and group_digits < 3:
+            digit_count += 1
+            group_digits += 1
+            i += 1
+        if group_digits != 3:
+            # Trap continuation: invalid comma grouping.
+            return (comma_pos, digit_count, True)
+
+    return i, digit_count, contains_comma
+
+
+def consume_decimal_fraction(text: str, pos: int) -> Optional[Tuple[int, int]]:
+    """Consume . followed by one or more digits, one character at a time."""
+    if pos >= len(text) or text[pos] != ".":
+        return None
+    i = pos + 1
+    digits = 0
+    while i < len(text) and is_digit(text[i]):
+        digits += 1
+        i += 1
+    if digits == 0:
+        return None
+    return i, digits
+
+
+def consume_four_digit_year(text: str, pos: int) -> Optional[int]:
+    """Consume exactly four digits and require a boundary afterwards."""
+    i = pos
+    count = 0
+    while i < len(text) and count < 4 and is_digit(text[i]):
+        i += 1
+        count += 1
+    if count == 4 and has_right_boundary(text, i):
+        return i
+    return None
+
+
+def consume_day_number(text: str, pos: int) -> Optional[int]:
+    """
+    Consume 1 or 2 day digits. This is a finite-state check:
+    qDay1 accepts one digit; qDay2 accepts two digits; more digits are rejected.
+    """
+    i = pos
+    if i >= len(text) or not is_digit(text[i]):
+        return None
+    i += 1
+    if i < len(text) and is_digit(text[i]):
+        i += 1
+        if i < len(text) and is_digit(text[i]):
+            return None
+    return i
+
+
+def try_month_day_year(text: str, start: int) -> Optional[Match]:
+    """
+    Month-start date branch:
+        Month space day optional-comma space year
+    Examples:
+        April 23, 2021
+        June 1, 2021
+    """
+    if not has_left_boundary(text, start):
+        return None
+
+    month_match = match_any_word(text, start, MONTHS)
+    if month_match is None:
+        return None
+
+    _, i = month_match
+    if i >= len(text) or not text[i].isspace():
+        return None
+    i = skip_spaces(text, i)
+
+    day_end = consume_day_number(text, i)
+    if day_end is None:
+        return None
+    i = day_end
+
+    if i < len(text) and text[i] == ",":
+        i += 1
+
+    if i >= len(text) or not text[i].isspace():
+        return None
+    i = skip_spaces(text, i)
+
+    year_end = consume_four_digit_year(text, i)
+    if year_end is None:
+        return None
+
+    return Match(text[start:year_end], "date", start, year_end)
+
+
+def try_digit_start_token(text: str, start: int) -> Optional[Match]:
+    """
+    Numeric-start DFA branch. It reads the first numeric body, then decides by the
+    next single character transition whether the token is percentage, ordinal,
+    quantity, year, or day-month-year date.
+    """
+    if not has_left_boundary(text, start):
+        return None
+
+    integer = consume_integer_body(text, start)
+    if integer is None:
+        return None
+
+    i, digit_count, contains_comma = integer
+
+    # Percentage: digits% or digits.decimal%
+    if i < len(text) and text[i] == "%":
+        end = i + 1
+        if has_right_boundary(text, end):
+            return Match(text[start:end], "percentage", start, end)
+
+    dec = consume_decimal_fraction(text, i)
+    if dec is not None:
+        dec_end, _ = dec
+        if dec_end < len(text) and text[dec_end] == "%":
+            end = dec_end + 1
+            if has_right_boundary(text, end):
+                return Match(text[start:end], "percentage", start, end)
+
+    # Ordinal: st / nd / rd / th, expanded as two transitions.
+    suffixes = [("st", "ordinal"), ("nd", "ordinal"), ("rd", "ordinal"), ("th", "ordinal")]
+    if not contains_comma:
+        for suffix, kind in suffixes:
+            end = match_word(text, i, suffix)
+            if end is not None and has_right_boundary(text, end):
+                return Match(text[start:end], kind, start, end)
+
+    # Quantity without space, e.g. 1kg.
+    for unit, kind in UNITS_NO_SPACE:
+        end = match_word(text, i, unit)
+        if end is not None and has_right_boundary(text, end):
+            return Match(text[start:end], kind, start, end)
+
+    # Four-digit year. We require exactly four digits and a boundary.
+    if not contains_comma and digit_count == 4 and has_right_boundary(text, i):
+        return Match(text[start:i], "year", start, i)
+
+    # Space branch: quantity and day-month-year date.
+    if i < len(text) and text[i].isspace():
+        after_space = skip_spaces(text, i)
+
+        # Date: 1 or 2 day digits, space, Month, space, 4-digit year.
+        if not contains_comma and digit_count in (1, 2):
+            month_match = match_any_word(text, after_space, MONTHS)
+            if month_match is not None:
+                _, m_end = month_match
+                if m_end < len(text) and text[m_end].isspace():
+                    after_month_space = skip_spaces(text, m_end)
+                    year_end = consume_four_digit_year(text, after_month_space)
+                    if year_end is not None:
+                        return Match(text[start:year_end], "date", start, year_end)
+
+        # Quantity: number space unit.
+        unit_words = [u for u, _ in UNITS_AFTER_SPACE]
+        unit_match = match_any_word(text, after_space, unit_words)
+        if unit_match is not None:
+            _, unit_end = unit_match
+            if has_right_boundary(text, unit_end):
+                return Match(text[start:unit_end], "quantity", start, unit_end)
+
+    return None
+
+
+
+def invalid_long_day_month_year_end(text: str, start: int) -> Optional[int]:
+    """
+    Recognize an invalid date-like shape with a day longer than two digits:
+        DDD... space Month space YYYY
+    This prevents accepting the year inside '123 September 2024' as a separate
+    valid year token during the left-to-right search.
+    """
+    integer = consume_integer_body(text, start)
+    if integer is None:
+        return None
+    i, digit_count, contains_comma = integer
+    if contains_comma or digit_count <= 2:
+        return None
+    if i >= len(text) or not text[i].isspace():
+        return None
+    after_space = skip_spaces(text, i)
+    month_match = match_any_word(text, after_space, MONTHS)
+    if month_match is None:
+        return None
+    _, m_end = month_match
+    if m_end >= len(text) or not text[m_end].isspace():
+        return None
+    y_start = skip_spaces(text, m_end)
+    y_end = consume_four_digit_year(text, y_start)
+    return y_end
+
+def find_l2_patterns(text: str) -> List[Match]:
+    """
+    Search the full text. The scanner advances from left to right. When a complete
+    token is accepted, it records the occurrence and continues after that token.
+    """
+    matches: List[Match] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        found: Optional[Match] = None
+
+        if is_digit(text[i]):
+            found = try_digit_start_token(text, i)
+            if found is None:
+                invalid_end = invalid_long_day_month_year_end(text, i)
+                if invalid_end is not None:
+                    # Trap path for an invalid date-like token; skip it as one rejected unit.
+                    i = invalid_end
+                    continue
+        elif is_letter(text[i]):
+            # Month-start date branch.
+            found = try_month_day_year(text, i)
+
+        if found is not None:
+            matches.append(found)
+            i = found.end
+        else:
+            i += 1
+
+    return matches
+
+
+def highlight_text(text: str, matches: List[Match]) -> str:
+    """Mark accepted patterns using **...** for report/demo visualization."""
+    if not matches:
+        return text
+    output = []
+    last = 0
+    for m in matches:
+        output.append(text[last:m.start])
+        output.append("**" + text[m.start:m.end] + "**")
+        last = m.end
+    output.append(text[last:])
+    return "".join(output)
+
+
+def print_result(text: str, matches: List[Match]) -> None:
+    print("=" * 70)
+    print("Pattern (input string): L2 Number Data Finder")
+    print("Recognized categories: ordinal, percentage, quantity, year, date")
+    print("=" * 70)
+    print("Text used for demo:")
+    print(text)
+    print("=" * 70)
+
+    if matches:
+        print("Status: ACCEPT")
+    else:
+        print("Status: REJECT")
+
+    print(f"Occurrences of patterns: {len(matches)}")
+    if matches:
+        print("\nAccepted patterns:")
+        for index, m in enumerate(matches, 1):
+            print(f"{index:02d}. {m.token!r} | category={m.kind} | position={m.start}-{m.end - 1}")
+
+        print("\nVisualization using boldface:")
+        print(highlight_text(text, matches))
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DFA recognizer for L2 Number Data Finder")
+    parser.add_argument("file", nargs="?", help="Optional text file for demonstration")
+    parser.add_argument("--text", help="Optional direct text input")
+    args = parser.parse_args()
+
+    if args.text is not None:
+        text = args.text
+    elif args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = (
+            "By 2015, Malaysia had a population of over 30 million. "
+            "It became the 43rd most populous country. "
+            "Malaya achieved independence on 31 August 1957. "
+            "The GDP grew at an average of 6.5% per annum. "
+            "Paper submission: April 23, 2021. "
+            "Invalid examples: 12345, 21stcentury, 123 September 2024, 2cups."
+        )
+
+    matches = find_l2_patterns(text)
+    print_result(text, matches)
+
+
+if __name__ == "__main__":
+    main()
