@@ -1,0 +1,1311 @@
+
+
+
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+
+
+@dataclass
+class Match:
+    token: str
+    kind: str
+    start: int
+    end: int  # exclusive
+
+
+MONTHS = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december"
+]
+
+# Units are written as literal DFA chains; the program consumes these words
+# character by character through match_word().
+UNITS_AFTER_SPACE = [
+    ("million", "quantity"),
+    ("billion", "quantity"),
+    ("litre", "quantity"),
+    ("litres", "quantity"),
+    ("liter", "quantity"),
+    ("liters", "quantity"),
+    ("cup", "quantity"),
+    ("cups", "quantity"),
+    ("year", "quantity"),
+    ("years", "quantity"),
+    ("kilometre", "quantity"),
+    ("kilometres", "quantity"),
+    ("kilometer", "quantity"),
+    ("kilometers", "quantity"),
+    ("square kilometre", "quantity"),
+    ("square kilometres", "quantity"),
+    ("square kilometer", "quantity"),
+    ("square kilometers", "quantity"),
+    ("sq mi", "quantity"),
+    ("sq km", "quantity"),
+]
+
+UNITS_NO_SPACE = [
+    ("kg", "quantity"),
+    ("km", "quantity"),
+]
+
+
+def is_digit(ch: str) -> bool:
+    return "0" <= ch <= "9"
+
+
+def is_letter(ch: str) -> bool:
+    return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+
+def is_boundary_char(ch: str) -> bool:
+    """A boundary is whitespace or punctuation/end. Letters and digits are not boundaries."""
+    return not (is_digit(ch) or is_letter(ch))
+
+
+def has_left_boundary(text: str, pos: int) -> bool:
+    return pos == 0 or is_boundary_char(text[pos - 1])
+
+
+def has_right_boundary(text: str, pos: int) -> bool:
+    return pos >= len(text) or is_boundary_char(text[pos])
+
+
+def skip_spaces(text: str, pos: int) -> int:
+    """DFA-style loop over one or more whitespace characters."""
+    i = pos
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return i
+
+
+def match_word(text: str, pos: int, word: str) -> Optional[int]:
+    """
+    Match a fixed literal word one character at a time.
+    Spaces inside the word, such as 'sq mi', are handled as exactly one-or-more
+    whitespace characters in the input.
+    """
+    i = pos
+    j = 0
+    while j < len(word):
+        expected = word[j]
+        if expected == " ":
+            if i >= len(text) or not text[i].isspace():
+                return None
+            i = skip_spaces(text, i)
+            j += 1
+            continue
+
+        if i >= len(text):
+            return None
+        current = text[i].lower()
+        if current != expected:
+            return None
+        i += 1
+        j += 1
+    return i
+
+
+def match_any_word(text: str, pos: int, words: List[str]) -> Optional[Tuple[str, int]]:
+    """
+    Try literal words. The longest word is tested first to avoid accepting 'litre'
+    before 'litres'. Each candidate is still checked character by character.
+    """
+    for word in sorted(words, key=len, reverse=True):
+        end = match_word(text, pos, word)
+        if end is not None:
+            return word, end
+    return None
+
+
+def consume_integer_body(text: str, pos: int) -> Optional[Tuple[int, int, bool]]:
+    """
+    Consume a positive integer body from pos.
+    This DFA permits:
+        2017
+        329,847
+        127,350
+    It rejects invalid comma continuations such as 12,34 as a complete number.
+    Return: (end_position, number_of_digits, contains_comma)
+    """
+    i = pos
+    digit_count = 0
+    contains_comma = False
+
+    if i >= len(text) or not is_digit(text[i]):
+        return None
+
+    # First digit group: one or more digits.
+    while i < len(text) and is_digit(text[i]):
+        digit_count += 1
+        i += 1
+
+    # Optional repeated comma groups of exactly 3 digits.
+    while i < len(text) and text[i] == ",":
+        contains_comma = True
+        comma_pos = i
+        i += 1
+        group_digits = 0
+        while i < len(text) and is_digit(text[i]) and group_digits < 3:
+            digit_count += 1
+            group_digits += 1
+            i += 1
+        if group_digits != 3:
+            # Trap continuation: invalid comma grouping.
+            return (comma_pos, digit_count, True)
+
+    return i, digit_count, contains_comma
+
+
+def consume_decimal_fraction(text: str, pos: int) -> Optional[Tuple[int, int]]:
+    """Consume . followed by one or more digits, one character at a time."""
+    if pos >= len(text) or text[pos] != ".":
+        return None
+    i = pos + 1
+    digits = 0
+    while i < len(text) and is_digit(text[i]):
+        digits += 1
+        i += 1
+    if digits == 0:
+        return None
+    return i, digits
+
+
+def consume_four_digit_year(text: str, pos: int) -> Optional[int]:
+    """Consume exactly four digits and require a boundary afterwards."""
+    i = pos
+    count = 0
+    while i < len(text) and count < 4 and is_digit(text[i]):
+        i += 1
+        count += 1
+    if count == 4 and has_right_boundary(text, i):
+        return i
+    return None
+
+
+def consume_day_number(text: str, pos: int) -> Optional[int]:
+    """
+    Consume 1 or 2 day digits. This is a finite-state check:
+    qDay1 accepts one digit; qDay2 accepts two digits; more digits are rejected.
+    """
+    i = pos
+    if i >= len(text) or not is_digit(text[i]):
+        return None
+    i += 1
+    if i < len(text) and is_digit(text[i]):
+        i += 1
+        if i < len(text) and is_digit(text[i]):
+            return None
+    return i
+
+
+def try_month_day_year(text: str, start: int) -> Optional[Match]:
+    """
+    Month-start date branch:
+        Month space day optional-comma space year
+    Examples:
+        April 23, 2021
+        June 1, 2021
+    """
+    if not has_left_boundary(text, start):
+        return None
+
+    month_match = match_any_word(text, start, MONTHS)
+    if month_match is None:
+        return None
+
+    _, i = month_match
+    if i >= len(text) or not text[i].isspace():
+        return None
+    i = skip_spaces(text, i)
+
+    day_end = consume_day_number(text, i)
+    if day_end is None:
+        return None
+    i = day_end
+
+    if i < len(text) and text[i] == ",":
+        i += 1
+
+    if i >= len(text) or not text[i].isspace():
+        return None
+    i = skip_spaces(text, i)
+
+    year_end = consume_four_digit_year(text, i)
+    if year_end is None:
+        return None
+
+    return Match(text[start:year_end], "date", start, year_end)
+
+
+def try_digit_start_token(text: str, start: int) -> Optional[Match]:
+    """
+    Numeric-start DFA branch. It reads the first numeric body, then decides by the
+    next single character transition whether the token is percentage, ordinal,
+    quantity, year, or day-month-year date.
+    """
+    if not has_left_boundary(text, start):
+        return None
+
+    integer = consume_integer_body(text, start)
+    if integer is None:
+        return None
+
+    i, digit_count, contains_comma = integer
+
+    # Percentage: digits% or digits.decimal%
+    if i < len(text) and text[i] == "%":
+        end = i + 1
+        if has_right_boundary(text, end):
+            return Match(text[start:end], "percentage", start, end)
+
+    dec = consume_decimal_fraction(text, i)
+    if dec is not None:
+        dec_end, _ = dec
+        if dec_end < len(text) and text[dec_end] == "%":
+            end = dec_end + 1
+            if has_right_boundary(text, end):
+                return Match(text[start:end], "percentage", start, end)
+
+    # Ordinal: st / nd / rd / th, expanded as two transitions.
+    suffixes = [("st", "ordinal"), ("nd", "ordinal"), ("rd", "ordinal"), ("th", "ordinal")]
+    if not contains_comma:
+        for suffix, kind in suffixes:
+            end = match_word(text, i, suffix)
+            if end is not None and has_right_boundary(text, end):
+                return Match(text[start:end], kind, start, end)
+
+    # Quantity without space, e.g. 1kg.
+    for unit, kind in UNITS_NO_SPACE:
+        end = match_word(text, i, unit)
+        if end is not None and has_right_boundary(text, end):
+            return Match(text[start:end], kind, start, end)
+
+    # Four-digit year. We require exactly four digits and a boundary.
+    if not contains_comma and digit_count == 4 and has_right_boundary(text, i):
+        return Match(text[start:i], "year", start, i)
+
+    # Space branch: quantity and day-month-year date.
+    if i < len(text) and text[i].isspace():
+        after_space = skip_spaces(text, i)
+
+        # Date: 1 or 2 day digits, space, Month, space, 4-digit year.
+        if not contains_comma and digit_count in (1, 2):
+            month_match = match_any_word(text, after_space, MONTHS)
+            if month_match is not None:
+                _, m_end = month_match
+                if m_end < len(text) and text[m_end].isspace():
+                    after_month_space = skip_spaces(text, m_end)
+                    year_end = consume_four_digit_year(text, after_month_space)
+                    if year_end is not None:
+                        return Match(text[start:year_end], "date", start, year_end)
+
+        # Quantity: number space unit.
+        unit_words = [u for u, _ in UNITS_AFTER_SPACE]
+        unit_match = match_any_word(text, after_space, unit_words)
+        if unit_match is not None:
+            _, unit_end = unit_match
+            if has_right_boundary(text, unit_end):
+                return Match(text[start:unit_end], "quantity", start, unit_end)
+
+    return None
+
+
+
+def invalid_long_day_month_year_end(text: str, start: int) -> Optional[int]:
+    """
+    Recognize an invalid date-like shape with a day longer than two digits:
+        DDD... space Month space YYYY
+    This prevents accepting the year inside '123 September 2024' as a separate
+    valid year token during the left-to-right search.
+    """
+    integer = consume_integer_body(text, start)
+    if integer is None:
+        return None
+    i, digit_count, contains_comma = integer
+    if contains_comma or digit_count <= 2:
+        return None
+    if i >= len(text) or not text[i].isspace():
+        return None
+    after_space = skip_spaces(text, i)
+    month_match = match_any_word(text, after_space, MONTHS)
+    if month_match is None:
+        return None
+    _, m_end = month_match
+    if m_end >= len(text) or not text[m_end].isspace():
+        return None
+    y_start = skip_spaces(text, m_end)
+    y_end = consume_four_digit_year(text, y_start)
+    return y_end
+
+def find_l2_patterns(text: str) -> List[Match]:
+    """
+    Search the full text. The scanner advances from left to right. When a complete
+    token is accepted, it records the occurrence and continues after that token.
+    """
+    matches: List[Match] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        found: Optional[Match] = None
+
+        if is_digit(text[i]):
+            found = try_digit_start_token(text, i)
+            if found is None:
+                invalid_end = invalid_long_day_month_year_end(text, i)
+                if invalid_end is not None:
+                    # Trap path for an invalid date-like token; skip it as one rejected unit.
+                    i = invalid_end
+                    continue
+        elif is_letter(text[i]):
+            # Month-start date branch.
+            found = try_month_day_year(text, i)
+
+        if found is not None:
+            matches.append(found)
+            i = found.end
+        else:
+            i += 1
+
+    return matches
+
+
+def highlight_text(text: str, matches: List[Match]) -> str:
+    """Mark accepted patterns using **...** for report/demo visualization."""
+    if not matches:
+        return text
+    output = []
+    last = 0
+    for m in matches:
+        output.append(text[last:m.start])
+        output.append("**" + text[m.start:m.end] + "**")
+        last = m.end
+    output.append(text[last:])
+    return "".join(output)
+
+
+def print_result(text: str, matches: List[Match]) -> None:
+    print("=" * 70)
+    print("Pattern (input string): L2 Number Data Finder")
+    print("Recognized categories: ordinal, percentage, quantity, year, date")
+    print("=" * 70)
+    print("Text used for demo:")
+    print(text)
+    print("=" * 70)
+
+    if matches:
+        print("Status: ACCEPT")
+    else:
+        print("Status: REJECT")
+
+    print(f"Occurrences of patterns: {len(matches)}")
+    if matches:
+        print("\nAccepted patterns:")
+        for index, m in enumerate(matches, 1):
+            print(f"{index:02d}. {m.token!r} | category={m.kind} | position={m.start}-{m.end - 1}")
+
+        print("\nVisualization using boldface:")
+        print(highlight_text(text, matches))
+
+
+def cli_main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DFA recognizer for L2 Number Data Finder")
+    parser.add_argument("file", nargs="?", help="Optional text file for demonstration")
+    parser.add_argument("--text", help="Optional direct text input")
+    args = parser.parse_args()
+
+    if args.text is not None:
+        text = args.text
+    elif args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = (
+            "By 2015, Malaysia had a population of over 30 million. "
+            "It became the 43rd most populous country. "
+            "Malaya achieved independence on 31 August 1957. "
+            "The GDP grew at an average of 6.5% per annum. "
+            "Paper submission: April 23, 2021. "
+            "Invalid examples: 12345, 21stcentury, 123 September 2024, 2cups."
+        )
+
+    matches = find_l2_patterns(text)
+    print_result(text, matches)
+
+
+# ===============================
+#  Desktop GUI + DFA Trace
+# ===============================
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+DEMO_TEXT = (
+    "By 2015, Malaysia had a population of over 30 million. "
+    "It became the 43rd most populous country. "
+    "Malaya achieved independence on 31 August 1957. "
+    "The GDP grew at an average of 6.5% per annum. "
+    "Paper submission: April 23, 2021. "
+    "Invalid examples: 12345, 21stcentury, 123 September 2024, 2cups."
+)
+
+@dataclass
+class TraceStep:
+    pos: int
+    state: str
+    action: str
+    detail: str
+    start: int
+    end: int
+    match: Optional[Match] = None
+
+def safe_char(text: str, pos: int) -> str:
+    if pos >= len(text):
+        return "<END>"
+    ch = text[pos]
+    if ch == "\n":
+        return "\\n"
+    if ch == "\t":
+        return "\\t"
+    if ch.isspace():
+        return "<space>"
+    return ch
+
+def step(text: str, pos: int, state: str, action: str, detail: str,
+         start: Optional[int] = None, end: Optional[int] = None,
+         match: Optional[Match] = None) -> TraceStep:
+    n = len(text)
+    pos = max(0, min(pos, n))
+    if start is None:
+        start = pos
+    if end is None:
+        end = min(pos + 1, n)
+    start = max(0, min(start, n))
+    end = max(start, min(end, n))
+    return TraceStep(pos, state, action, detail, start, end, match)
+
+def build_dfa_trace(text: str) -> Tuple[List[TraceStep], List[Match]]:
+    """Build a visual trace that mirrors the recognizer branches more closely."""
+    trace: List[TraceStep] = []
+    matches: List[Match] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        trace.append(step(text, i, "qScan", "Read character", f"Read position {i}: {safe_char(text, i)!r}."))
+
+        if is_digit(ch):
+            trace.append(step(
+                text, i, "qDigit", "Digit branch",
+                "The character is a digit, so the DFA enters the numeric branch."
+            ))
+
+            integer = consume_integer_body(text, i)
+            if integer is None:
+                trace.append(step(
+                    text, i, "qReject", "REJECT",
+                    "The numeric branch could not consume a valid integer body."
+                ))
+                i += 1
+                continue
+
+            end_i, digits, has_comma = integer
+            trace.append(step(
+                text, i, "qInteger", "Consume integer body",
+                f"Integer candidate: {text[i:end_i]!r}, digits={digits}, contains_comma={has_comma}.",
+                i, end_i
+            ))
+
+            if end_i < n and text[end_i] == "%":
+                end = end_i + 1
+                trace.append(step(
+                    text, end_i, "qPercent", "Check percentage",
+                    "Found '%' immediately after the integer body.",
+                    i, end
+                ))
+                if has_right_boundary(text, end):
+                    found = Match(text[i:end], "percentage", i, end)
+                    trace.append(step(
+                        text, i, "qAccept", "ACCEPT",
+                        f"Accepted {found.token!r} as {found.kind}.",
+                        found.start, found.end, found
+                    ))
+                    matches.append(found)
+                    i = found.end
+                    continue
+                trace.append(step(
+                    text, i, "qReject", "REJECT",
+                    "Percentage candidate failed right-boundary checking.",
+                    i, end
+                ))
+                i += 1
+                continue
+
+            dec = consume_decimal_fraction(text, end_i)
+            if dec is not None:
+                dec_end, frac_digits = dec
+                trace.append(step(
+                    text, end_i, "qPercent", "Check decimal percentage",
+                    f"Found decimal fraction with {frac_digits} digit(s).",
+                    i, dec_end
+                ))
+                if dec_end < n and text[dec_end] == "%":
+                    end = dec_end + 1
+                    if has_right_boundary(text, end):
+                        found = Match(text[i:end], "percentage", i, end)
+                        trace.append(step(
+                            text, i, "qAccept", "ACCEPT",
+                            f"Accepted {found.token!r} as {found.kind}.",
+                            found.start, found.end, found
+                        ))
+                        matches.append(found)
+                        i = found.end
+                        continue
+                trace.append(step(
+                    text, i, "qReject", "REJECT",
+                    "Decimal number did not complete a valid percentage token.",
+                    i, dec_end
+                ))
+                i += 1
+                continue
+
+            if not has_comma:
+                suffixes = [("st", "ordinal"), ("nd", "ordinal"), ("rd", "ordinal"), ("th", "ordinal")]
+                accepted = False
+                for suffix, kind in suffixes:
+                    end = match_word(text, end_i, suffix)
+                    if end is not None:
+                        trace.append(step(
+                            text, end_i, "qOrdinal", "Check ordinal suffix",
+                            f"Found ordinal suffix {suffix!r}.",
+                            i, end
+                        ))
+                        if has_right_boundary(text, end):
+                            found = Match(text[i:end], kind, i, end)
+                            trace.append(step(
+                                text, i, "qAccept", "ACCEPT",
+                                f"Accepted {found.token!r} as {found.kind}.",
+                                found.start, found.end, found
+                            ))
+                            matches.append(found)
+                            i = found.end
+                            accepted = True
+                            break
+                if accepted:
+                    continue
+
+            accepted = False
+            for unit, kind in UNITS_NO_SPACE:
+                end = match_word(text, end_i, unit)
+                if end is not None:
+                    trace.append(step(
+                        text, end_i, "qNoSpaceUnit", "Check no-space unit",
+                        f"Found no-space unit {unit!r}.",
+                        i, end
+                    ))
+                    if has_right_boundary(text, end):
+                        found = Match(text[i:end], kind, i, end)
+                        trace.append(step(
+                            text, i, "qAccept", "ACCEPT",
+                            f"Accepted {found.token!r} as {found.kind}.",
+                            found.start, found.end, found
+                        ))
+                        matches.append(found)
+                        i = found.end
+                        accepted = True
+                        break
+            if accepted:
+                continue
+
+            if not has_comma and digits == 4 and has_right_boundary(text, end_i):
+                trace.append(step(
+                    text, end_i, "qYear", "Check four-digit year",
+                    "The token has exactly four digits and passes boundary checking.",
+                    i, end_i
+                ))
+                found = Match(text[i:end_i], "year", i, end_i)
+                trace.append(step(
+                    text, i, "qAccept", "ACCEPT",
+                    f"Accepted {found.token!r} as {found.kind}.",
+                    found.start, found.end, found
+                ))
+                matches.append(found)
+                i = found.end
+                continue
+
+            if end_i < n and text[end_i].isspace():
+                after_space = skip_spaces(text, end_i)
+                trace.append(step(
+                    text, end_i, "qSpaceBranch", "Space branch",
+                    "After the number, whitespace is found. The DFA checks quantity and day-month-year date branches.",
+                    i, after_space
+                ))
+
+                if not has_comma and digits in (1, 2):
+                    month_match = match_any_word(text, after_space, MONTHS)
+                    if month_match is not None:
+                        month_word, m_end = month_match
+                        if m_end < n and text[m_end].isspace():
+                            after_month_space = skip_spaces(text, m_end)
+                            year_end = consume_four_digit_year(text, after_month_space)
+                            trace.append(step(
+                                text, after_space, "qDateDMY", "Check day-month-year date",
+                                f"Found month {month_word!r} after a 1-2 digit day candidate.",
+                                i, after_month_space
+                            ))
+                            if year_end is not None:
+                                found = Match(text[i:year_end], "date", i, year_end)
+                                trace.append(step(
+                                    text, i, "qAccept", "ACCEPT",
+                                    f"Accepted {found.token!r} as {found.kind}.",
+                                    found.start, found.end, found
+                                ))
+                                matches.append(found)
+                                i = found.end
+                                continue
+
+                unit_words = [u for u, _ in UNITS_AFTER_SPACE]
+                unit_match = match_any_word(text, after_space, unit_words)
+                if unit_match is not None:
+                    unit_word, unit_end = unit_match
+                    trace.append(step(
+                        text, after_space, "qQuantity", "Check quantity",
+                        f"Found quantity unit {unit_word!r}.",
+                        i, unit_end
+                    ))
+                    if has_right_boundary(text, unit_end):
+                        found = Match(text[i:unit_end], "quantity", i, unit_end)
+                        trace.append(step(
+                            text, i, "qAccept", "ACCEPT",
+                            f"Accepted {found.token!r} as {found.kind}.",
+                            found.start, found.end, found
+                        ))
+                        matches.append(found)
+                        i = found.end
+                        continue
+
+            invalid_end = invalid_long_day_month_year_end(text, i)
+            if invalid_end is not None:
+                trace.append(step(
+                    text, i, "qTrap", "TRAP invalid date-like token",
+                    "Rejected a long day-month-year shape so the inner year is not accepted separately.",
+                    i, invalid_end
+                ))
+                i = invalid_end
+                continue
+
+            trace.append(step(
+                text, i, "qReject", "REJECT",
+                "No numeric-start pattern is accepted at this position."
+            ))
+            i += 1
+            continue
+
+        if is_letter(ch):
+            trace.append(step(
+                text, i, "qMonthStart", "Letter branch",
+                "The character is a letter, so the DFA checks whether it starts a month-day-year date."
+            ))
+            found = try_month_day_year(text, i)
+            if found is not None:
+                trace.append(step(
+                    text, i, "qDateMDY", "Check month-day-year date",
+                    f"Month-start date candidate found: {found.token!r}.",
+                    found.start, found.end
+                ))
+                trace.append(step(
+                    text, i, "qAccept", "ACCEPT",
+                    f"Accepted {found.token!r} as {found.kind}.",
+                    found.start, found.end, found
+                ))
+                matches.append(found)
+                i = found.end
+                continue
+
+            trace.append(step(
+                text, i, "qReject", "REJECT",
+                "This letter does not start a valid month-day-year date."
+            ))
+            i += 1
+            continue
+
+        trace.append(step(
+            text, i, "qSkip", "Skip",
+            "This character is not a possible token start."
+        ))
+        i += 1
+
+    trace.append(step(
+        text, n, "qDone", "Finished",
+        f"Scanning finished. Total accepted patterns: {len(matches)}.",
+        n, n
+    ))
+    return trace, matches
+
+def format_result(text: str, matches: List[Match]) -> str:
+    lines = []
+    lines.append("=" * 70)
+    lines.append("Pattern (input string): L2 Number Data Finder")
+    lines.append("Recognized categories: ordinal, percentage, quantity, year, date")
+    lines.append("=" * 70)
+    lines.append("Text used for demo:")
+    lines.append(text)
+    lines.append("=" * 70)
+    lines.append("Status: ACCEPT" if matches else "Status: REJECT")
+    lines.append(f"Occurrences of patterns: {len(matches)}")
+    if matches:
+        lines.append("\nAccepted patterns:")
+        for index, m in enumerate(matches, 1):
+            lines.append(f"{index:02d}. {m.token!r} | category={m.kind} | position={m.start}-{m.end - 1}")
+        lines.append("\nVisualization using boldface:")
+        lines.append(highlight_text(text, matches))
+    return "\n".join(lines)
+
+STATE_LABELS = {
+    "qScan": "qScan",
+    "qDigit": "qDigit",
+    "qInteger": "qInteger",
+    "qPercent": "qPercent",
+    "qOrdinal": "qOrdinal",
+    "qYear": "qYear",
+    "qNoSpaceUnit": "qNoSpaceUnit",
+    "qSpaceBranch": "qSpaceBranch",
+    "qQuantity": "qQuantity",
+    "qDateDMY": "qDateDMY",
+    "qMonthStart": "qMonthStart",
+    "qDateMDY": "qDateMDY",
+    "qAccept": "qAccept",
+    "qReject": "qReject",
+    "qTrap": "qTrap",
+    "qSkip": "qSkip",
+    "qDone": "qDone",
+}
+
+class L2DFAVisualizerApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("L2 Number Data Finder - DFA Visualizer")
+        self.root.geometry("1220x800")
+        self.root.minsize(1050, 680)
+
+        self.steps: List[TraceStep] = []
+        self.step_index = 0
+        self.after_id = None
+        self.running = False
+        self.paused = False
+        self.live_matches: List[Match] = []
+        self.final_matches: List[Match] = []
+        self.current_text = ""
+
+        self._build_style()
+        self._build_ui()
+        self.input_text.insert("1.0", DEMO_TEXT)
+        self.analyze_now()
+
+    def _build_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("Action.TButton", font=("Segoe UI", 10), padding=6)
+        style.configure("Status.TLabel", font=("Segoe UI", 12, "bold"))
+        style.configure("Treeview", rowheight=25)
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill="both", expand=True)
+
+        ttk.Label(main, text="L2 Number Data Finder - DFA Process Visualizer", style="Title.TLabel").pack(anchor="w")
+
+
+        bar = ttk.Frame(main)
+        bar.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(bar, text="Analyze Now", style="Action.TButton", command=self.analyze_now).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="Visualize Step by Step", style="Action.TButton", command=self.start_visual).pack(side="left", padx=6)
+        self.pause_btn = ttk.Button(bar, text="Pause", style="Action.TButton", command=self.pause_resume, state="disabled")
+        self.pause_btn.pack(side="left", padx=6)
+        self.stop_btn = ttk.Button(bar, text="Stop", style="Action.TButton", command=self.stop_visual, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+        ttk.Button(bar, text="Load TXT", style="Action.TButton", command=self.load_file).pack(side="left", padx=6)
+        ttk.Button(bar, text="Demo", style="Action.TButton", command=self.load_demo).pack(side="left", padx=6)
+        ttk.Button(bar, text="Clear", style="Action.TButton", command=self.clear_all).pack(side="left", padx=6)
+        ttk.Button(bar, text="Save", style="Action.TButton", command=self.save_result).pack(side="left", padx=6)
+
+        ttk.Label(bar, text="Delay:").pack(side="right")
+        self.delay = tk.IntVar(value=450)
+        ttk.Scale(bar, from_=80, to=1500, variable=self.delay, orient="horizontal", length=170).pack(side="right", padx=8)
+
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill="both", expand=True)
+        left = ttk.Frame(paned, padding=(0, 0, 8, 0))
+        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
+        paned.add(left, weight=1)
+        paned.add(right, weight=1)
+
+        ttk.Label(left, text="Input Text", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        in_frame = ttk.Frame(left)
+        in_frame.pack(fill="both", expand=True, pady=(6, 8))
+        self.input_text = tk.Text(in_frame, wrap="word", font=("Consolas", 11), undo=True, relief="solid", borderwidth=1)
+        sc = ttk.Scrollbar(in_frame, command=self.input_text.yview)
+        self.input_text.configure(yscrollcommand=sc.set)
+        self.input_text.pack(side="left", fill="both", expand=True)
+        sc.pack(side="right", fill="y")
+
+        ttk.Label(left, text="Live Highlight", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        hi_frame = ttk.Frame(left)
+        hi_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.highlight = tk.Text(hi_frame, wrap="word", font=("Consolas", 11), state="disabled", relief="solid", borderwidth=1)
+        self.highlight.tag_configure("accepted", background="#bff0c1")
+        self.highlight.tag_configure("current", background="#ffd37a")
+        hs = ttk.Scrollbar(hi_frame, command=self.highlight.yview)
+        self.highlight.configure(yscrollcommand=hs.set)
+        self.highlight.pack(side="left", fill="both", expand=True)
+        hs.pack(side="right", fill="y")
+
+        summary = ttk.LabelFrame(right, text="Current Step", padding=10)
+        summary.pack(fill="x")
+        self.status_var = tk.StringVar(value="Status: -")
+        self.count_var = tk.StringVar(value="Occurrences: 0")
+        self.state_var = tk.StringVar(value="State: qScan")
+        self.action_var = tk.StringVar(value="Action: -")
+        self.detail_var = tk.StringVar(value="Detail: -")
+        ttk.Label(summary, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w")
+        ttk.Label(summary, textvariable=self.count_var).pack(anchor="w")
+        ttk.Label(summary, textvariable=self.state_var).pack(anchor="w")
+        ttk.Label(summary, textvariable=self.action_var).pack(anchor="w")
+        ttk.Label(summary, textvariable=self.detail_var, wraplength=500, justify="left").pack(anchor="w")
+
+        ttk.Label(right, text="DFA State Flow", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(8, 0))
+        dfa_frame = ttk.Frame(right)
+        dfa_frame.pack(fill="both", pady=(6, 8))
+
+        self.canvas = tk.Canvas(
+            dfa_frame,
+            width=860,
+            height=320,
+            bg="white",
+            relief="solid",
+            borderwidth=1,
+            xscrollincrement=20,
+            yscrollincrement=20,
+            cursor="fleur",
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        dfa_frame.columnconfigure(0, weight=1)
+        dfa_frame.rowconfigure(0, weight=1)
+
+        self.canvas_xscroll = ttk.Scrollbar(dfa_frame, orient="horizontal", command=self.canvas.xview)
+        self.canvas_xscroll.grid(row=1, column=0, sticky="ew")
+        self.canvas_yscroll = ttk.Scrollbar(dfa_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas_yscroll.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(xscrollcommand=self.canvas_xscroll.set, yscrollcommand=self.canvas_yscroll.set)
+        self.canvas.bind("<ButtonPress-1>", self._start_canvas_pan)
+        self.canvas.bind("<B1-Motion>", self._drag_canvas_pan)
+
+        nb = ttk.Notebook(right)
+        nb.pack(fill="both", expand=True)
+        tab1 = ttk.Frame(nb, padding=6)
+        tab2 = ttk.Frame(nb, padding=6)
+        tab3 = ttk.Frame(nb, padding=6)
+        nb.add(tab1, text="Accepted Patterns")
+        nb.add(tab2, text="DFA Log")
+        nb.add(tab3, text="Output")
+
+        self.table = ttk.Treeview(tab1, columns=("no", "token", "kind", "pos"), show="headings")
+        for col, title, width in [("no", "#", 50), ("token", "Token", 230), ("kind", "Category", 120), ("pos", "Position", 100)]:
+            self.table.heading(col, text=title)
+            self.table.column(col, width=width, anchor="center" if col != "token" else "w")
+        ts = ttk.Scrollbar(tab1, command=self.table.yview)
+        self.table.configure(yscrollcommand=ts.set)
+        self.table.pack(side="left", fill="both", expand=True)
+        ts.pack(side="right", fill="y")
+
+        self.log = tk.Text(tab2, wrap="word", font=("Consolas", 10), state="disabled", relief="solid", borderwidth=1)
+        ls = ttk.Scrollbar(tab2, command=self.log.yview)
+        self.log.configure(yscrollcommand=ls.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        ls.pack(side="right", fill="y")
+
+        self.output = tk.Text(tab3, wrap="word", font=("Consolas", 10), state="disabled", relief="solid", borderwidth=1)
+        os = ttk.Scrollbar(tab3, command=self.output.yview)
+        self.output.configure(yscrollcommand=os.set)
+        self.output.pack(side="left", fill="both", expand=True)
+        os.pack(side="right", fill="y")
+
+        self.draw_dfa("qScan")
+
+    def get_text(self) -> str:
+        return self.input_text.get("1.0", "end-1c")
+
+    def analyze_now(self):
+        self.stop_visual(silent=True)
+        text = self.get_text()
+        matches = find_l2_patterns(text)
+        self.current_text = text
+        self.final_matches = matches
+        self.update_summary(matches, "qDone", "Instant analysis", "Finished without animation.")
+        self.update_table(matches)
+        self.update_highlight(text, matches, None)
+        self.set_output(format_result(text, matches))
+        self.clear_log()
+        self.add_log("Instant analysis completed. Click Visualize Step by Step to show the DFA process.")
+        self.draw_dfa("qDone")
+
+    def start_visual(self):
+        self.stop_visual(silent=True)
+        self.current_text = self.get_text()
+        self.steps, self.final_matches = build_dfa_trace(self.current_text)
+        self.step_index = 0
+        self.live_matches = []
+        self.running = True
+        self.paused = False
+        self.pause_btn.configure(text="Pause", state="normal")
+        self.stop_btn.configure(state="normal")
+        self.update_table([])
+        self.update_highlight(self.current_text, [], None)
+        self.set_output(format_result(self.current_text, self.final_matches))
+        self.clear_log()
+        self.add_log("DFA visualization started.")
+        self.root.after(0, self.next_step)
+
+    def next_step(self):
+        if not self.running or self.paused:
+            return
+
+        if self.step_index >= len(self.steps):
+            self.finish_visual()
+            return
+
+        s = self.steps[self.step_index]
+        self.step_index += 1
+
+        if s.match and not any(m.start == s.match.start and m.end == s.match.end for m in self.live_matches):
+            self.live_matches.append(s.match)
+
+        self.update_summary(self.live_matches, s.state, s.action, s.detail)
+        self.update_table(self.live_matches)
+        self.update_highlight(self.current_text, self.live_matches, (s.start, s.end))
+        self.draw_dfa(s.state)
+        self.add_log(
+            f"Step {self.step_index:03d} | pos={s.pos:03d} | char={safe_char(self.current_text, s.pos)!r} "
+            f"| {s.state} | {s.action} | {s.detail}"
+        )
+        self.after_id = self.root.after(int(self.delay.get()), self.next_step)
+
+    def finish_visual(self):
+        self.running = False
+        self.paused = False
+        self.pause_btn.configure(text="Pause", state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.update_summary(self.final_matches, "qDone", "Finished", "The DFA has scanned the whole input.")
+        self.update_table(self.final_matches)
+        self.update_highlight(self.current_text, self.final_matches, None)
+        self.draw_dfa("qDone")
+        self.add_log("DFA visualization finished.")
+
+    def pause_resume(self):
+        if not self.running:
+            return
+        self.paused = not self.paused
+        if self.paused:
+            if self.after_id:
+                self.root.after_cancel(self.after_id)
+                self.after_id = None
+            self.pause_btn.configure(text="Resume")
+            self.add_log("Paused.")
+        else:
+            self.pause_btn.configure(text="Pause")
+            self.add_log("Resumed.")
+            self.next_step()
+
+    def stop_visual(self, silent=False):
+        if self.after_id:
+            try:
+                self.root.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+            self.after_id = None
+
+        was_running = self.running
+        self.running = False
+        self.paused = False
+
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.configure(text="Pause", state="disabled")
+            self.stop_btn.configure(state="disabled")
+
+        if was_running and not silent:
+            self.add_log("Stopped.")
+
+    def update_summary(self, matches, state, action, detail):
+        self.status_var.set("Status: " + ("ACCEPT" if matches else "REJECT"))
+        self.count_var.set(f"Occurrences so far: {len(matches)}")
+        self.state_var.set(f"State: {state}")
+        self.action_var.set(f"Action: {action}")
+        self.detail_var.set(f"Detail: {detail}")
+
+    def update_table(self, matches):
+        for row in self.table.get_children():
+            self.table.delete(row)
+        for i, m in enumerate(matches, 1):
+            self.table.insert("", "end", values=(f"{i:02d}", m.token, m.kind, f"{m.start}-{m.end - 1}"))
+
+    def update_highlight(self, text, matches, current):
+        self.highlight.configure(state="normal")
+        self.highlight.delete("1.0", "end")
+        self.highlight.insert("1.0", text)
+
+        for m in matches:
+            self.highlight.tag_add("accepted", f"1.0+{m.start}c", f"1.0+{m.end}c")
+
+        if current:
+            a, b = current
+            if a == b and a < len(text):
+                b = a + 1
+            if a < len(text):
+                self.highlight.tag_add("current", f"1.0+{a}c", f"1.0+{min(b, len(text))}c")
+                self.highlight.see(f"1.0+{a}c")
+
+        self.highlight.configure(state="disabled")
+
+    def set_output(self, content):
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.insert("1.0", content)
+        self.output.configure(state="disabled")
+
+    def clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+    def add_log(self, line):
+        self.log.configure(state="normal")
+        self.log.insert("end", line + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _start_canvas_pan(self, event):
+        self.canvas.scan_mark(event.x, event.y)
+
+    def _drag_canvas_pan(self, event):
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def draw_dfa(self, active):
+        c = self.canvas
+        c.delete("all")
+
+        nodes = {
+            "qScan": (90, 220),
+            "qDigit": (320, 90),
+            "qInteger": (610, 90),
+            "qPercent": (970, 40),
+            "qOrdinal": (970, 150),
+            "qYear": (970, 260),
+            "qNoSpaceUnit": (970, 370),
+            "qSpaceBranch": (1280, 150),
+            "qQuantity": (1600, 70),
+            "qDateDMY": (1600, 220),
+            "qMonthStart": (320, 360),
+            "qDateMDY": (970, 520),
+            "qTrap": (1280, 370),
+            "qReject": (1600, 430),
+            "qAccept": (1910, 220),
+            "qDone": (2120, 220),
+            "qSkip": (320, 220),
+        }
+
+        radius = 34
+
+        def right_point(x, y):
+            return x + radius, y
+
+        def left_point(x, y):
+            return x - radius, y
+
+        def arrow(a, b, label="", y_shift=0):
+            x1, y1 = nodes[a]
+            x2, y2 = nodes[b]
+            sx, sy = right_point(x1, y1)
+            ex, ey = left_point(x2, y2)
+            c.create_line(sx, sy, ex, ey, arrow=tk.LAST, fill="#777", width=2)
+            if label:
+                c.create_text((sx + ex) / 2, ((sy + ey) / 2) + y_shift, text=label, font=("Segoe UI", 8), fill="#555")
+
+        def back_arrow(a, b, label="", y_shift=0):
+            x1, y1 = nodes[a]
+            x2, y2 = nodes[b]
+            c.create_line(
+                x1, y1 + radius, x1, y1 + 46,
+                x2, y2 + 46, x2, y2 + radius,
+                smooth=True, arrow=tk.LAST, fill="#999", width=2
+            )
+            if label:
+                c.create_text((x1 + x2) / 2, max(y1, y2) + 56 + y_shift, text=label, font=("Segoe UI", 8), fill="#666")
+
+        def loop_arrow(state, label):
+            x, y = nodes[state]
+            c.create_arc(x - 25, y - 55, x + 25, y - 5, start=40, extent=280, style=tk.ARC, outline="#777", width=2)
+            c.create_text(x, y - 62, text=label, font=("Segoe UI", 8), fill="#555")
+
+        edges = [
+            ("qScan", "qDigit", "digit", -10),
+            ("qScan", "qMonthStart", "letter", 10),
+            ("qScan", "qSkip", "other", 18),
+            ("qDigit", "qInteger", "consume digits", -12),
+            ("qInteger", "qPercent", "% / .digits%", -12),
+            ("qInteger", "qOrdinal", "st|nd|rd|th", 0),
+            ("qInteger", "qYear", "4 digits + boundary", 0),
+            ("qInteger", "qNoSpaceUnit", "kg|km", 8),
+            ("qInteger", "qSpaceBranch", "space", -10),
+            ("qSpaceBranch", "qQuantity", "unit", -12),
+            ("qSpaceBranch", "qDateDMY", "Month + YYYY", 8),
+            ("qMonthStart", "qDateMDY", "Month Day Year", 12),
+            ("qInteger", "qTrap", "invalid long day", 22),
+            ("qInteger", "qReject", "no valid branch", 32),
+            ("qMonthStart", "qReject", "not a date", 30),
+            ("qPercent", "qAccept", "accept", -12),
+            ("qOrdinal", "qAccept", "accept", -2),
+            ("qYear", "qAccept", "accept", 4),
+            ("qNoSpaceUnit", "qAccept", "accept", 12),
+            ("qQuantity", "qAccept", "accept", -8),
+            ("qDateDMY", "qAccept", "accept", 4),
+            ("qDateMDY", "qAccept", "accept", 18),
+            ("qSkip", "qDone", "end", 14),
+            ("qAccept", "qDone", "end", -10),
+        ]
+
+        for a, b, label, y_shift in edges:
+            arrow(a, b, label, y_shift)
+
+        back_arrow("qAccept", "qScan", "continue scanning")
+        back_arrow("qReject", "qScan", "next position", 8)
+        back_arrow("qTrap", "qScan", "skip invalid token", 16)
+
+        loop_arrow("qScan", "scan loop")
+
+        for state, (x, y) in nodes.items():
+            if state == active:
+                fill, outline, width = "#ffd37a", "#c77700", 3
+            elif state == "qAccept":
+                fill, outline, width = "#d7f7d7", "#4b9b4b", 2
+            elif state in ("qReject", "qTrap"):
+                fill, outline, width = "#ffd6d6", "#b64b4b", 2
+            elif state == "qDone":
+                fill, outline, width = "#ececec", "#666666", 2
+            else:
+                fill, outline, width = "#eef5ff", "#5f7ea8", 1
+
+            c.create_oval(
+                x - radius, y - radius, x + radius, y + radius,
+                fill=fill, outline=outline, width=width
+            )
+
+            if state == "qAccept":
+                c.create_oval(
+                    x - radius + 6, y - radius + 6, x + radius - 6, y + radius - 6,
+                    outline=outline, width=1
+                )
+
+            c.create_text(
+                x, y,
+                text=STATE_LABELS.get(state, state),
+                font=("Segoe UI", 8),
+                justify="center"
+            )
+
+        bbox = c.bbox("all")
+        if bbox:
+            pad = 60
+            c.configure(scrollregion=(bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad))
+    def load_demo(self):
+        self.stop_visual(silent=True)
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", DEMO_TEXT)
+        self.analyze_now()
+
+    def clear_all(self):
+        self.stop_visual(silent=True)
+        self.input_text.delete("1.0", "end")
+        self.analyze_now()
+
+    def load_file(self):
+        self.stop_visual(silent=True)
+        path = filedialog.askopenfilename(
+            title="Choose a text file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="gbk", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", content)
+        self.analyze_now()
+
+    def save_result(self):
+        content = self.output.get("1.0", "end-1c")
+        log = self.log.get("1.0", "end-1c")
+
+        if log.strip():
+            content += "\n\n" + "=" * 70 + "\nDFA PROCESS LOG\n" + "=" * 70 + "\n" + log
+
+        path = filedialog.asksaveasfilename(
+            title="Save result",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+
+        messagebox.showinfo("Saved", "Result saved successfully.")
+
+
+def gui_main() -> None:
+    root = tk.Tk()
+    L2DFAVisualizerApp(root)
+    root.mainloop()
+
+
+def main() -> None:
+    """
+    With command-line arguments, the original CLI behavior is preserved:
+        python l2_number_data_finder_visual_dfa.py --text "By 2015, GDP grew 6.5%."
+        python l2_number_data_finder_visual_dfa.py input.txt
+
+    Without arguments, the local desktop GUI opens:
+        python l2_number_data_finder_visual_dfa.py
+    """
+    import sys
+    if len(sys.argv) > 1:
+        cli_main()
+    else:
+        gui_main()
+
+
+if __name__ == "__main__":
+    main()
+
