@@ -242,8 +242,7 @@ def try_digit_start_token(text: str, start: int) -> Optional[Match]:
 
     if digit_count == 4 and "," not in text[start:i] and has_right_boundary(text, i):
                return Match(text[start:i], "year", start, i)
-    if contains_comma and has_right_boundary(text, i):
-               return Match(text[start:i], "quantity", start, i)
+
 
 
     if i < len(text) and text[i].isspace():
